@@ -1,0 +1,685 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Basketball by Pontic Labs</title>
+  <style>
+    body { margin: 0; overflow: hidden; }
+    canvas { display: block; }
+    #instructions {
+      position: fixed; top: 10px; left: 10px; background: rgba(0,0,0,0.7);
+      color: #fff; padding: 10px; border-radius: 8px; font-family: sans-serif; z-index: 10;
+    }
+  </style>
+</head>
+<body>
+  <div id="instructions">
+    Click the canvas to lock pointer/look around.<br>
+    Use <b>WASD</b> to move, E to pick up ball.<br>
+    Left click and release to charge and shoot.<br>
+    Pontic Labs (TM)
+  </div>
+  <div id="scoreboard" style="position:fixed;top:10px;right:10px;background:rgba(0,0,0,0.7);color:#fff;padding:10px;border-radius:8px;font-family:sans-serif;z-index:10;">
+    Loading scores...
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.154.0/build/three.min.js"></script>
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+  <script>
+  // --- Utility to generate a random color ---
+  function getRandomColor() {
+    const colors = [0xffa500, 0x00aaff, 0xff00aa, 0x00ffaa, 0xffff00, 0xff4444, 0x8888ff];
+    return colors[Math.floor(Math.random() * colors.length)];
+  }
+
+  // --- Player state and multiplayer setup ---
+  const socket = io();
+  const players = {};
+  let myId = null;
+  let myColor = getRandomColor();
+  let hoopColors = [null, null]; // Will hold the colors of the first two users
+
+  // --- Three.js setup ---
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x87ceeb);
+
+  const camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 1000);
+  camera.position.set(0, 8, 15);
+  camera.lookAt(0, 0, 0);
+
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  document.body.appendChild(renderer.domElement);
+
+  scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+  const dirLight = new THREE.DirectionalLight(0xffffff, 0.7);
+  dirLight.position.set(10, 20, 10);
+  scene.add(dirLight);
+
+  // --- Simple ground/court ---
+  const courtWidth = 8;
+  const courtHeight = 15;
+  const floorGeometry = new THREE.PlaneGeometry(20, 30); // Much larger than the court
+  const floorMaterial = new THREE.MeshPhongMaterial({ color: 0xffa500 }); // Orange
+  const floor = new THREE.Mesh(floorGeometry, floorMaterial);
+  floor.rotation.x = -Math.PI / 2;
+  scene.add(floor);
+  
+  // --- Court lines material (white) ---
+const lineMaterial = new THREE.LineBasicMaterial({ color: 0xffffff, linewidth: 2 });
+
+// Helper to add a line
+function addCourtLine(points) {
+  const geometry = new THREE.BufferGeometry().setFromPoints(points);
+  const line = new THREE.Line(geometry, lineMaterial);
+  scene.add(line);
+}
+
+// Sidelines and baselines (rectangle)
+addCourtLine([
+  new THREE.Vector3(-4, 0.02, -7.5),
+  new THREE.Vector3(4, 0.02, -7.5),
+  new THREE.Vector3(4, 0.02, 7.5),
+  new THREE.Vector3(-4, 0.02, 7.5),
+  new THREE.Vector3(-4, 0.02, -7.5)
+]);
+
+// Center line
+addCourtLine([
+  new THREE.Vector3(-4, 0.021, 0),
+  new THREE.Vector3(4, 0.021, 0)
+]);
+
+// Center circle
+const centerCircle = new THREE.Line(
+  new THREE.BufferGeometry().setFromPoints(
+    Array.from({length: 65}, (_, i) => {
+      const theta = (i / 64) * Math.PI * 2;
+      return new THREE.Vector3(Math.cos(theta) * 1.2, 0.022, Math.sin(theta) * 1.2);
+    })
+  ),
+  lineMaterial
+);
+scene.add(centerCircle);
+
+// Key rectangles (the "paint")
+addCourtLine([
+  new THREE.Vector3(-0.8, 0.023, -7.5),
+  new THREE.Vector3(-0.8, 0.023, -4.55),
+  new THREE.Vector3(0.8, 0.023, -4.55),
+  new THREE.Vector3(0.8, 0.023, -7.5),
+  new THREE.Vector3(-0.8, 0.023, -7.5)
+]);
+addCourtLine([
+  new THREE.Vector3(-0.8, 0.023, 7.5),
+  new THREE.Vector3(-0.8, 0.023, 4.55),
+  new THREE.Vector3(0.8, 0.023, 4.55),
+  new THREE.Vector3(0.8, 0.023, 7.5),
+  new THREE.Vector3(-0.8, 0.023, 7.5)
+]);
+
+// Free throw arcs (half circles at top of key)
+function addArc(cx, cz, radius, startAngle, endAngle) {
+  const points = [];
+  for (let i = 0; i <= 32; i++) {
+    const t = startAngle + (endAngle - startAngle) * (i / 32);
+    points.push(new THREE.Vector3(cx + Math.cos(t) * radius, 0.022, cz + Math.sin(t) * radius));
+  }
+  addCourtLine(points);
+}
+// Left free throw arc (facing up court)
+addArc(0, -4.55, 0.8, Math.PI * 1, Math.PI * 0);
+// Right free throw arc (facing down court)
+addArc(0, 4.55, 0.8, -Math.PI * 1, Math.PI * 0);
+
+// 3-point arcs (centered at basket, not at top of key)
+addArc(0, -7.5, 3.75, Math.PI * 1, Math.PI * 0);
+addArc(0, 7.5, 3.75, -Math.PI * 1, -Math.PI * 0.0);
+
+
+// --- Preset skin tones ---
+const skinTones = [
+  0xffe0bd, // light
+  0xffcd94,
+  0xeac086,
+  0xffad60,
+  0x8d5524, // dark
+  0xc68642,
+  0xe0ac69,
+  // 0xf1c27d
+];
+function getRandomSkinTone() {
+  return skinTones[Math.floor(Math.random() * skinTones.length)];
+}
+
+// --- Blocky humanoid avatar ---
+function createHumanoid(jerseyColor, skinTone) {
+  const group = new THREE.Group();
+
+  // Use the provided skinTone for head, arms, and legs
+  const headColor = skinTone;
+
+  // Body (jersey)
+  const body = new THREE.Mesh(
+    new THREE.BoxGeometry(0.4, 0.55, 0.2),
+    new THREE.MeshPhongMaterial({ color: jerseyColor })
+  );
+  body.position.y = 0.8;
+  group.add(body);
+
+  // Head
+  const head = new THREE.Mesh(
+    new THREE.BoxGeometry(0.3, 0.3, 0.3),
+    new THREE.MeshPhongMaterial({ color: headColor })
+  );
+  head.position.y = 1.25;
+  group.add(head);
+
+  // Left Arm (pivot at shoulder)
+  const lArmGroup = new THREE.Group();
+  lArmGroup.position.set(-0.3, 1.05, 0);
+  const lArm = new THREE.Mesh(
+    new THREE.BoxGeometry(0.15, 0.5, 0.15),
+    new THREE.MeshPhongMaterial({ color: headColor })
+  );
+  lArm.position.y = -0.25;
+  lArmGroup.add(lArm);
+  group.add(lArmGroup);
+
+  // Right Arm
+  const rArmGroup = new THREE.Group();
+  rArmGroup.position.set(0.3, 1.05, 0);
+  const rArm = lArm.clone();
+  rArmGroup.add(rArm);
+  rArm.position.y = -0.25;
+  group.add(rArmGroup);
+
+  // Left Leg (pivot at hip)
+  const lLegGroup = new THREE.Group();
+  lLegGroup.position.set(-0.12, 0.5, 0);
+  const lLeg = new THREE.Mesh(
+    new THREE.BoxGeometry(0.15, 0.5, 0.15),
+    new THREE.MeshPhongMaterial({ color: headColor })
+  );
+  lLeg.position.y = -0.25;
+  lLegGroup.add(lLeg);
+  group.add(lLegGroup);
+
+  // Right Leg
+  const rLegGroup = new THREE.Group();
+  rLegGroup.position.set(0.12, 0.5, 0);
+  const rLeg = lLeg.clone();
+  rLegGroup.add(rLeg);
+  rLeg.position.y = -0.25;
+  group.add(rLegGroup);
+
+  // Attach references for animation
+  group.leftArm = lArmGroup;
+  group.rightArm = rArmGroup;
+  group.leftLeg = lLegGroup;
+  group.rightLeg = rLegGroup;
+
+  return group;
+}
+
+// --- Player management ---
+function addPlayer(id, color, skinTone, x = 0, z = 0) {
+  if (players[id]) return;
+  // Use a fallback skin tone if not provided
+  const finalSkinTone = (typeof skinTone !== "undefined") ? skinTone : getRandomSkinTone();
+  const humanoid = createHumanoid(color, finalSkinTone);
+  humanoid.position.set(x, 0, z);
+  scene.add(humanoid);
+  players[id] = {
+    id,
+    mesh: humanoid,
+    color,
+    skinTone: finalSkinTone,
+    x,
+    z,
+    targetX: x,
+    targetZ: z
+  };
+}
+
+function removePlayer(id) {
+  if (players[id]) {
+    scene.remove(players[id].mesh);
+    delete players[id];
+  }
+}
+
+function movePlayer(id, x, z, yaw, y) {
+  if (!players[id]) return;
+  players[id].targetX = x;
+  players[id].targetZ = z;
+  if (yaw !== undefined) players[id].targetYaw = yaw;
+  players[id].targetY = (y !== undefined) ? y : (players[id].targetY || 0);
+}
+
+// --- Socket events ---
+  socket.on('connect', () => {
+    myId = socket.id;
+    socket.emit('new-player', { color: myColor });
+  });
+  socket.on('players-update', (allPlayers) => {
+    // Remove players not in the update
+    Object.keys(players).forEach(id => {
+      if (!allPlayers[id]) removePlayer(id);
+    });
+    // Add or update players
+    Object.entries(allPlayers).forEach(([id, data]) => {
+      addPlayer(id, data.color, data.skinTone, data.x, data.z);
+      movePlayer(id, data.x, data.z, data.yaw, data.y);
+      if (players[id]) players[id].charging = data.charging; // <-- add this
+    });
+
+    // Assign hoop colors to the first two players
+    const ids = Object.keys(allPlayers);
+    if (ids.length > 0) hoopColors[0] = allPlayers[ids[0]].color;
+    if (ids.length > 1) hoopColors[1] = allPlayers[ids[1]].color;
+  });
+  socket.on('ball-update', (serverBall) => {
+    ball = serverBall;
+  });
+socket.on('scores-update', ({ players: serverPlayers, scores }) => {
+  let html = '<b>Scores</b><br>';
+  Object.entries(scores).forEach(([id, score]) => {
+    let color = serverPlayers[id]?.color || '#fff';
+    // Convert number to hex string if needed
+    if (typeof color === "number") {
+      color = "#" + color.toString(16).padStart(6, "0");
+    }
+    const you = id === myId ? ' (You)' : '';
+    html += `<span style="color:${color};"><b>${id.slice(-4)}</b></span>${you}: ${score}<br>`;
+  });
+  document.getElementById('scoreboard').innerHTML = html;
+});
+
+socket.on('game-winner', ({ winner, color }) => {
+  alert(`Player ${winner} (${color}) wins!`);
+});
+
+  // --- Pointer lock and mouse look ---
+  const canvas = renderer.domElement;
+  canvas.addEventListener('click', () => {
+    canvas.requestPointerLock();
+  });
+
+  let yaw = 0;
+  let pitch = 0;
+  function onPointerMove(event) {
+    yaw -= event.movementX * 0.002;
+    pitch -= event.movementY * 0.002;
+    const maxPitch = Math.PI / 2 - 0.1;
+    if (pitch > maxPitch) pitch = maxPitch;
+    if (pitch < -maxPitch) pitch = -maxPitch;
+
+    // Emit yaw update to server
+    if (myId && players[myId]) {
+      const player = players[myId];
+      socket.emit('move', { x: player.targetX, z: player.targetZ, yaw });
+    }
+  }
+  document.addEventListener('pointerlockchange', () => {
+    if (document.pointerLockElement === canvas) {
+      document.addEventListener('mousemove', onPointerMove, false);
+    } else {
+      document.removeEventListener('mousemove', onPointerMove, false);
+    }
+  });
+
+  // --- Sprint and Jump state ---
+  let isSprinting = false;
+  let lastWPress = 0;
+  let sprintTimeout = null;
+  let velocityY = 0;
+  let isOnGround = true;
+  const gravity = -0.025;
+  const jumpStrength = 0.28;
+
+  // --- Charging state ---
+  let isCharging = false;
+  let chargeStart = 0;
+
+  // --- Movement controls ---
+  const keyState = {};
+  window.addEventListener('keydown', (e) => {
+    const key = e.key.toLowerCase();
+    keyState[key] = true;
+
+    // Sprint on double-press W
+    if (key === 'w') {
+      const now = performance.now();
+      if (now - lastWPress < 250) {
+        isSprinting = true;
+        clearTimeout(sprintTimeout);
+        sprintTimeout = setTimeout(() => { isSprinting = false; }, 1000); // Sprint lasts 1s after double-press
+      }
+      lastWPress = now;
+    }
+
+    // Jump
+    if (key === ' ' && isOnGround) {
+      velocityY = jumpStrength;
+      isOnGround = false;
+    }
+    if (key === 'e') {
+      // Try to pick up the ball
+      socket.emit('pickup-ball');
+    }
+    if (key === 'q') {
+      // Drop the ball
+      socket.emit('drop-ball');
+    }
+  });
+  window.addEventListener('keyup', (e) => {
+    const key = e.key.toLowerCase();
+    keyState[key] = false;
+    if (key === 'w') {
+      isSprinting = false;
+      clearTimeout(sprintTimeout);
+    }
+  });
+
+  // --- Basketball setup ---
+const ballRadius = 0.18;
+const ballGeometry = new THREE.SphereGeometry(ballRadius, 24, 24);
+const ballMaterial = new THREE.MeshPhongMaterial({ color: 0xff8800 });
+const basketball = new THREE.Mesh(ballGeometry, ballMaterial);
+basketball.castShadow = true;
+scene.add(basketball);
+
+let ball = { x: 0, y: 1, z: 0, heldBy: null };
+
+// --- Hoops and backboards ---
+function createHoop(x, y, z, color = 0xff5500) {
+  const rimGeo = new THREE.TorusGeometry(0.4, 0.04, 12, 32);
+  const rimMat = new THREE.MeshPhongMaterial({ color });
+  const rim = new THREE.Mesh(rimGeo, rimMat);
+  rim.position.set(x, y, z);
+  rim.rotation.x = Math.PI / 2;
+  scene.add(rim);
+  // Backboard
+  const boardGeo = new THREE.BoxGeometry(1.9, 1.2, 0.05);
+  const boardMat = new THREE.MeshPhongMaterial({ color: 0xffffff });
+  const board = new THREE.Mesh(boardGeo, boardMat);
+  board.position.set(x, y + 0.45, z + (z > 0 ? 0.45 : -0.45));
+  scene.add(board);
+  return rim; // So we can update color later
+}
+
+// Create hoops and keep references to their rim meshes
+const hoopRims = [
+  createHoop(0, 2.5, -7.2, hoopColors[0] || 0xff5500),
+  createHoop(0, 2.5,  7.2, hoopColors[1] || 0xff5500)
+];
+
+// Update hoop rim colors if player colors change
+if (hoopColors[0] && hoopRims[0]) {
+  let color = hoopColors[0];
+  if (typeof color === "number") {
+    hoopRims[0].material.color.setHex(color);
+  } else {
+    hoopRims[0].material.color.set(color);
+  }
+}
+if (hoopColors[1] && hoopRims[1]) {
+  let color = hoopColors[1];
+  if (typeof color === "number") {
+    hoopRims[1].material.color.setHex(color);
+  } else {
+    hoopRims[1].material.color.set(color);
+  }
+}
+
+  // --- Animate ---
+  function animate() {
+    requestAnimationFrame(animate);
+
+    Object.values(players).forEach(player => {
+      player.x += (player.targetX - player.x) * 0.2;
+      player.z += (player.targetZ - player.z) * 0.2;
+      player.y = player.y || 0;
+      player.targetY = player.targetY || 0;
+      player.y += (player.targetY - player.y) * 0.2;
+      player.mesh.position.set(player.x, player.y, player.z);
+
+      // Lerp rotation for smooth turning
+      if (player.targetYaw !== undefined) {
+        player.yaw = player.yaw || 0;
+        // Shortest angle interpolation
+        let delta = player.targetYaw - player.yaw;
+        if (delta > Math.PI) delta -= 2 * Math.PI;
+        if (delta < -Math.PI) delta += 2 * Math.PI;
+        player.yaw += delta * 0.2;
+        player.mesh.rotation.y = player.yaw;
+      }
+    });
+
+    if (myId && players[myId]) {
+      const player = players[myId];
+      const mesh = player.mesh;
+
+      // Only rotate player with yaw if pointer lock is active
+      if (document.pointerLockElement === canvas) {
+        mesh.rotation.y = yaw;
+      }
+
+      // First-person camera: position at player's head, look in yaw/pitch direction
+      const headHeight = 1.2;
+      camera.position.set(
+        mesh.position.x,
+        (mesh.position.y || 0) + headHeight,
+        mesh.position.z
+      );
+      // Calculate look direction from yaw and pitch
+      const lookDir = new THREE.Vector3(
+        Math.sin(yaw) * Math.cos(pitch),
+        Math.sin(pitch),
+        Math.cos(yaw) * Math.cos(pitch)
+      );
+      const lookTarget = new THREE.Vector3().addVectors(camera.position, lookDir);
+      camera.lookAt(lookTarget);
+
+      let moved = false;
+      let moveX = 0, moveZ = 0;
+      let speed = isSprinting ? 0.56 : 0.26;
+
+      // WASD movement relative to yaw (first-person)
+      if (keyState['w']) {
+        moveX += Math.sin(yaw) * speed;
+        moveZ += Math.cos(yaw) * speed;
+        moved = true;
+      }
+      if (keyState['s']) {
+        moveX -= Math.sin(yaw) * speed;
+        moveZ -= Math.cos(yaw) * speed;
+        moved = true;
+      }
+      if (keyState['a']) {
+        moveX += Math.cos(yaw) * speed;
+        moveZ -= Math.sin(yaw) * speed;
+        moved = true;
+      }
+      if (keyState['d']) {
+        moveX -= Math.cos(yaw) * speed;
+        moveZ += Math.sin(yaw) * speed;
+        moved = true;
+      }
+
+      // Gravity and jump
+      velocityY += gravity;
+      let newY = (player.y || 0) + velocityY;
+      if (newY <= 0) {
+        newY = 0;
+        velocityY = 0;
+        isOnGround = true;
+      } else {
+        isOnGround = false;
+      }
+      player.y = newY;
+
+      // Clamp to court bounds
+      let newX = Math.max(-courtWidth/2 + 0.3, Math.min(player.x + moveX, courtWidth/2 - 0.3));
+      let newZ = Math.max(-courtHeight/2 + 0.3, Math.min(player.z + moveZ, courtHeight/2 - 0.3));
+
+      if (moved || velocityY !== 0) {
+        player.targetX = newX;
+        player.targetZ = newZ;
+        socket.emit('move', { x: newX, z: newZ, y: newY, yaw });
+      }
+      // Always update vertical position locally
+      mesh.position.y = player.y;
+    }
+
+    // Update basketball position
+    if (ball.heldBy && players[ball.heldBy]) {
+      const holder = players[ball.heldBy];
+      const forward = 0.4;
+      const ballRadius = 0.18;
+      const dribbleSpeed = 8;
+      const t = performance.now() * 0.001 * dribbleSpeed;
+      const handHeight = 0.8;
+
+      // If local player is charging, hold the ball up and forward
+      if (holder === players[myId] && isCharging) {
+        // Ball held up near hand (no dribble)
+        basketball.position.set(
+          holder.x + Math.sin(holder.yaw || 0) * (forward + 0.08),
+          (holder.y || 0) + handHeight + 0.12, // slightly above hand
+          holder.z + Math.cos(holder.yaw || 0) * (forward + 0.08)
+        );
+      } else if (holder.charging) {
+        // Show holding animation for any player who is charging
+        basketball.position.set(
+          holder.x + Math.sin(holder.yaw || 0) * (forward + 0.08),
+          (holder.y || 0) + handHeight + 0.12,
+          holder.z + Math.cos(holder.yaw || 0) * (forward + 0.08)
+        );
+      } else {
+        // Dribble animation
+        const dribbleY = ballRadius + Math.abs(Math.sin(t)) * (handHeight - ballRadius);
+        basketball.position.set(
+          holder.x + Math.sin(holder.yaw || 0) * forward,
+          (holder.y || 0) + dribbleY,
+          holder.z + Math.cos(holder.yaw || 0) * forward
+        );
+      }
+
+      // Always set the arm pose every frame
+      if (holder.mesh && holder.mesh.rightArm) {
+        if ((holder === players[myId] && isCharging) || holder.charging) {
+          // Charging pose
+          holder.mesh.rightArm.rotation.x = -1.2;
+          holder.mesh.rightArm.rotation.z = 0.5;
+          holder.mesh.leftArm.rotation.x = -1.2;
+          holder.mesh.leftArm.rotation.z = -0.5;
+        } else {
+          // Dribble pose: sync arm swing with dribble
+          const dribbleSpeed = 8;
+          const t = performance.now() * 0.001 * dribbleSpeed;
+          const dribblePhase = Math.abs(Math.sin(t)); // 0 (bottom) to 1 (top)
+          // Arm swings down as ball goes down, up as ball goes up
+          holder.mesh.rightArm.rotation.x = -1.0 + dribblePhase * 0.7; // -1.0 (down) to -0.3 (up)
+          holder.mesh.rightArm.rotation.z = 0;
+        }
+      }
+    } else {
+      // Ball not held: just set to server position
+      basketball.position.set(ball.x, ball.y, ball.z);
+
+      // Reset right arm pose for all players (optional: only for local player)
+      Object.values(players).forEach(player => {
+        if (player.mesh && player.mesh.rightArm) {
+          player.mesh.rightArm.rotation.x = 0;
+          player.mesh.rightArm.rotation.z = 0;
+        }
+      });
+    }
+
+    // Update hoop rim colors if player colors change
+    if (hoopColors[0] && hoopRims[0]) {
+      let color = hoopColors[0];
+      if (typeof color === "number") {
+        hoopRims[0].material.color.setHex(color);
+      } else {
+        hoopRims[0].material.color.set(color);
+      }
+    }
+    if (hoopColors[1] && hoopRims[1]) {
+      let color = hoopColors[1];
+      if (typeof color === "number") {
+        hoopRims[1].material.color.setHex(color);
+      } else {
+        hoopRims[1].material.color.set(color);
+      }
+    }
+
+    // Animate limbs for all players (including rightArm swing)
+    Object.values(players).forEach(player => {
+      const mesh = player.mesh;
+      if (mesh.leftArm && mesh.rightArm && mesh.leftLeg && mesh.rightLeg) {
+        // Calculate movement speed for swing
+        const dx = player.targetX - player.x;
+        const dz = player.targetZ - player.z;
+        const speed = Math.sqrt(dx * dx + dz * dz);
+        const time = performance.now() * 0.005;
+        const swing = Math.sin(time * 5) * Math.min(speed * 25, 1) * 1.2;
+
+        // Default: walk swing for all limbs
+        mesh.leftArm.rotation.x = swing;
+        mesh.leftLeg.rotation.x = -swing;
+        mesh.rightLeg.rotation.x = swing;
+
+        // Special case: right arm
+        if (ball.heldBy === player.id) {
+          if ((player === players[myId] && isCharging) || player.charging) {
+            // Charging pose
+            mesh.rightArm.rotation.x = -1.2;
+            mesh.rightArm.rotation.z = 0.5;
+            mesh.leftArm.rotation.x = -1.2;
+            mesh.leftArm.rotation.z = -0.5;
+          } else {
+            // Dribble pose: sync arm swing with dribble
+            const dribbleSpeed = 8;
+            const t = performance.now() * 0.001 * dribbleSpeed;
+            const dribblePhase = Math.abs(Math.sin(t));
+            mesh.rightArm.rotation.x = -1.0 + dribblePhase * 0.7;
+            mesh.rightArm.rotation.z = 0;
+          }
+        } else {
+          // Not holding the ball: walk swing
+          mesh.rightArm.rotation.x = -swing;
+          mesh.rightArm.rotation.z = 0;
+        }
+      }
+    });
+
+    renderer.render(scene, camera);
+  }
+  animate();
+
+canvas.addEventListener('mousedown', (e) => {
+  if (e.button === 0 && ball.heldBy === myId) {
+    isCharging = true;
+    chargeStart = performance.now();
+    socket.emit('charging', true);
+  }
+});
+canvas.addEventListener('mouseup', (e) => {
+  if (e.button === 0 && ball.heldBy === myId && isCharging) {
+    isCharging = false;
+    socket.emit('charging', false);
+    const chargeTime = Math.min(1200, performance.now() - chargeStart); // max 1.2s
+    const power = 0.3 + (chargeTime / 1300); // 0.5 to 1.5
+    const dir = {
+      x: Math.sin(yaw) * Math.cos(pitch),
+      y: Math.max(0.3, Math.sin(pitch) + 1.05),
+      z: Math.cos(yaw) * Math.cos(pitch)
+    };
+    socket.emit('shoot-ball', { dir, power });
+  }
+});
+  </script>
+</body>
+</html>
