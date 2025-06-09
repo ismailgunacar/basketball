@@ -1,7 +1,9 @@
 # Basketball
 
 Basketball by Pontic Labs (Ismail Gunacar). Demo here: https://ball.ponticlabs.com.
-![alt text](bball1.png)
+![image 1](bball1.png)
+![image 2](bball2.png)
+
 
 Written with three.js, socket.io, and express. 
 
